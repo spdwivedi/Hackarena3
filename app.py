@@ -3,204 +3,527 @@ import geopandas as gpd
 from shapely.wkt import loads
 from shapely.geometry import LineString
 import folium
+from folium.plugins import SideBySideLayers
 from streamlit_folium import st_folium
 import re
+import pandas as pd
+import altair as alt
+import google.generativeai as genai  # NEW: For RAG
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Axes Systems: Smart Displacement", layout="wide")
+st.set_page_config(page_title="Axes Systems: Spatial Intelligence", layout="wide", page_icon="🗺️")
 
-# --- STEP 1: ROBUST PARSER ---
+# --- CUSTOM CSS ---
+st.markdown("""
+<style>
+    .stApp { background-color: #0E1117; color: white; }
+    div[data-testid="stMetric"] {
+        background-color: #1F2937; padding: 15px; border-radius: 10px;
+        border-left: 5px solid #00C9FF; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    h1, h2, h3 { font-family: 'Helvetica Neue', sans-serif; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- GEMINI RAG CONFIGURATION ---
+# INSTRUCTION: Get your key from https://aistudio.google.com/
+# Set it in your secrets or paste it below (not recommended for production)
+GEMINI_API_KEY = st.sidebar.text_input("🔑 Gemini API Key (for Explanations)", type="AIzaSyB64HsMxMJaAQQN6KP9AxGnNlaKTXHbgwA")
+
+def get_gemini_explanation(stats_summary, context_text):
+    """
+    RAG Function: Sends geometric data to Gemini for a natural language explanation.
+    """
+    if not GEMINI_API_KEY:
+        return "⚠️ Please enter a Gemini API Key in the sidebar to generate an AI explanation."
+    
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = f"""
+        You are a senior Civil Engineer AI. Analyze this displacement report.
+        
+        DATA CONTEXT:
+        We have a highway and local roads. We moved roads that were too close to the highway.
+        
+        STATISTICS:
+        {stats_summary}
+        
+        TECHNICAL DETAILS:
+        {context_text}
+        
+        TASK:
+        1. Summarize what happened in plain English for a city planner.
+        2. Explain the "Safety Score" (F1 Score) and what it implies about the algorithm's performance.
+        3. Point out any specific roads that moved significantly.
+        """
+        
+        with st.spinner("🤖 AI is analyzing the geometry..."):
+            response = model.generate_content(prompt)
+            return response.text
+    except Exception as e:
+        return f"Error connecting to AI: {e}"
+
+# --- GEOMETRY UTILS ---
 def parse_wkt_data(raw_text):
     geometries = []
-    if not raw_text or not raw_text.strip():
-        return geometries
-        
+    if not raw_text or not raw_text.strip(): return geometries
     try:
         clean_text = raw_text.replace('\n', ' ').replace('\r', ' ')
         matches = re.findall(r'LINESTRING\s*\([^)]+\)', clean_text)
-        for wkt in matches:
-            geometries.append(loads(wkt))
-    except Exception as e:
-        st.error(f"Parsing Error: {e}")
+        for wkt in matches: geometries.append(loads(wkt))
+    except Exception as e: st.error(f"Parsing Error: {e}")
     return geometries
 
-# --- STEP 2: DISPLACEMENT LOGIC ---
-def displace_features(highway, roads, clearance, road_width=3.0, h_width=5.0):
-    displaced_roads = []
-    stats = {"overlaps_found": 0, "overlaps_fixed": 0}
+def calculate_advanced_metrics(highway, original_roads, displaced_roads, clearance, road_width=3.0, h_width=5.0):
+    """
+    Calculates Confusion Matrix elements and F1 Score for the geometric operation.
+    """
+    safe_dist = (h_width/2) + (road_width/2) + clearance
+    highway_buffer = highway.buffer(safe_dist)
     
+    tp = 0 # Needed moving & Moved successfully
+    fp = 0 # Didn't need moving & Moved (Efficiency loss)
+    fn = 0 # Needed moving & NOT Moved (Safety violation)
+    tn = 0 # Didn't need moving & NOT Moved
+    
+    details = []
+    
+    for orig, new in zip(original_roads, displaced_roads):
+        was_unsafe = orig.intersects(highway_buffer)
+        is_moved = orig != new
+        is_now_safe = not new.intersects(highway_buffer)
+        
+        if was_unsafe and is_moved and is_now_safe:
+            tp += 1
+            status = "TP (Fixed)"
+        elif was_unsafe and (not is_moved or not is_now_safe):
+            fn += 1
+            status = "FN (Safety Fail)"
+        elif not was_unsafe and is_moved:
+            fp += 1
+            status = "FP (Unnecessary Move)"
+        else:
+            tn += 1
+            status = "TN (Clean)"
+            
+        # Calculate shift distance
+        shift = 0
+        if is_moved:
+            try:
+                shift = orig.centroid.distance(new.centroid)
+            except: pass
+            
+        details.append({"Status": status, "Shift": shift})
+
+    # F1 Score Calculation
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return {
+        "matrix": {"TP": tp, "FP": fp, "FN": fn, "TN": tn},
+        "scores": {"Precision": precision, "Recall": recall, "F1": f1},
+        "details": details
+    }
+
+def displace_features(highway, roads, clearance):
+    displaced_roads = []
+    road_width = 3.0
+    h_width = 5.0
     safe_buffer_distance = (h_width / 2) + (road_width / 2) + clearance
     highway_buffer = highway.buffer(safe_buffer_distance)
     
     for road in roads:
         if road.intersects(highway_buffer):
-            stats["overlaps_found"] += 1
             distance_to_move = safe_buffer_distance * 1.05
+            shifted = road.parallel_offset(distance_to_move, 'left', join_style=2)
+            if shifted.is_empty or not isinstance(shifted, LineString):
+                 shifted = road.parallel_offset(distance_to_move, 'right', join_style=2)
             
-            # Try Left
-            shifted_road = road.parallel_offset(distance_to_move, 'left', join_style=2)
-            
-            # Try Right if Left fails
-            if shifted_road.is_empty or not isinstance(shifted_road, LineString):
-                 shifted_road = road.parallel_offset(distance_to_move, 'right', join_style=2)
-            
-            if not shifted_road.is_empty and isinstance(shifted_road, LineString):
-                displaced_roads.append(shifted_road)
-                stats["overlaps_fixed"] += 1
+            if not shifted.is_empty and isinstance(shifted, LineString):
+                displaced_roads.append(shifted)
             else:
-                displaced_roads.append(road) 
+                displaced_roads.append(road) # Fail safe
         else:
             displaced_roads.append(road)
             
-    return displaced_roads, stats
+    return displaced_roads
 
-#-----------------
-
-def normalize_for_web(features):
-    """
-    Shifts coordinates to (0,0) so they fit on a web map (geojson.io).
-    This is for VISUALIZATION ONLY, not real-world location.
-    """
-    import copy
-    
-    # 1. Calculate Centroid of the Highway to use as an anchor
-    # We take the first coordinate of the highway as "0,0"
-    ref_x = features[0].coords[0][0]
-    ref_y = features[0].coords[0][1]
-    
-    web_features = []
-    
-    for line in features:
-        # Shift every point by subtracting the reference
-        # We assume the "local units" are roughly meters. 
-        # 1 degree lat is ~111,000m. dividing by 1000 keeps it visible.
-        new_coords = [((p[0] - ref_x) / 1000, (p[1] - ref_y) / 1000) for p in line.coords]
-        
-        web_features.append(LineString(new_coords))
-        
-    return web_features
-
-#------------------
-
-# --- STEP 3: USER INTERFACE ---
-st.title("🗺️ Axes Systems: AI Map Displacement Tool")
+# --- MAIN APP ---
+st.title("🗺️ Axes Systems: AI Geometric Optimization")
 
 with st.sidebar:
-    st.header("⚙️ Rules")
-    clearance = st.slider("Min Clearance (pt)", 0.5, 5.0, 2.0)
-    st.info("Priorities:\n1. Highway (Fixed)\n2. Roads (Moveable)")
+    st.header("⚙️ Controls")
+    clearance = st.slider("Clearance Buffer", 0.5, 5.0, 2.0)
+    input_method = st.radio("Input:", ["Upload File", "Paste Text"])
+    raw_data = ""
+    if input_method == "Paste Text":
+        raw_data = st.text_area("Paste WKT:", height=150)
+    else:
+        uploaded_file = st.file_uploader("Upload WKT", type=["wkt", "txt"])
+        if uploaded_file is not None: raw_data = uploaded_file.read().decode("utf-8")
 
-st.subheader("1. Data Import")
-input_method = st.radio("Select Input Method:", ["Paste Text", "Upload File"], horizontal=True)
-
-raw_data = ""
-if input_method == "Paste Text":
-    raw_data = st.text_area("Paste WKT content here:", height=150)
-else:
-    uploaded_file = st.file_uploader("Upload WKT File", type=["wkt", "txt", "csv"])
-    if uploaded_file is not None:
-        raw_data = uploaded_file.read().decode("utf-8")
-
-if st.button("🚀 Run Displacement AI"):
-    with st.spinner("Processing Geometry..."):
-        all_lines = parse_wkt_data(raw_data)
+if st.button("🚀 Run Analysis"):
+    all_lines = parse_wkt_data(raw_data)
+    if len(all_lines) > 1:
+        highway = max(all_lines, key=lambda x: x.length)
+        roads = [line for line in all_lines if line != highway]
         
-        if len(all_lines) < 2:
-            st.warning("⚠️ Waiting for data... Need at least 2 lines.")
+        # 1. Run Displacement
+        fixed_roads = displace_features(highway, roads, clearance)
+        
+        # 2. Calculate Advanced Metrics
+        metrics = calculate_advanced_metrics(highway, roads, fixed_roads, clearance)
+        
+        st.session_state['data'] = {
+            'highway': highway, 'roads': roads, 'fixed': fixed_roads, 'metrics': metrics
+        }
+    else:
+        st.error("Need at least 2 lines.")
+
+if 'data' in st.session_state:
+    d = st.session_state['data']
+    m_res = d['metrics']
+    
+    # --- TABBED INTERFACE ---
+    tab1, tab2, tab3 = st.tabs(["📍 Visualizer", "📊 Analytics & F1", "🤖 AI Report (RAG)"])
+    
+    with tab1:
+        st.subheader("Interactive Displacement Map")
+        centroid = d['highway'].centroid
+        m = folium.Map(location=[centroid.y, centroid.x], zoom_start=16, crs="Simple", tiles=None)
+        
+        folium.PolyLine([(p[1], p[0]) for p in d['highway'].coords], color="orange", weight=8).add_to(m)
+        
+        fg_orig = folium.FeatureGroup(name="Before")
+        for r in d['roads']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="red", weight=2).add_to(fg_orig)
+        
+        fg_new = folium.FeatureGroup(name="After")
+        for r in d['fixed']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#00FF00", weight=3).add_to(fg_new)
+        
+        SideBySideLayers(layer_left=fg_orig, layer_right=fg_new).add_to(m)
+        folium.LayerControl().add_to(m)
+        st_folium(m, width="100%")
+
+    with tab2:
+        st.subheader("Performance Metrics")
+        
+        # F1 SCORE ROW
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("F1 Score", f"{m_res['scores']['F1']:.2f}")
+        c2.metric("Precision", f"{m_res['scores']['Precision']:.2f}")
+        c3.metric("Recall", f"{m_res['scores']['Recall']:.2f}")
+        c4.metric("Total Roads", len(d['roads']))
+        
+        # CONFUSION MATRIX VISUALIZATION
+        st.markdown("### Confusion Matrix (Geometric Accuracy)")
+        matrix_data = pd.DataFrame([
+            {"Actual": "Unsafe", "Predicted": "Moved", "Count": m_res['matrix']['TP'], "Type": "True Positive"},
+            {"Actual": "Unsafe", "Predicted": "Static", "Count": m_res['matrix']['FN'], "Type": "False Negative"},
+            {"Actual": "Safe", "Predicted": "Moved", "Count": m_res['matrix']['FP'], "Type": "False Positive"},
+            {"Actual": "Safe", "Predicted": "Static", "Count": m_res['matrix']['TN'], "Type": "True Negative"}
+        ])
+        
+        cm_chart = alt.Chart(matrix_data).mark_rect().encode(
+            x='Predicted:N',
+            y='Actual:N',
+            color='Count:Q',
+            tooltip=['Type', 'Count']
+        ).properties(title="Confusion Matrix")
+        
+        text = cm_chart.mark_text(baseline='middle').encode(text='Count:Q', color=alt.value('white'))
+        st.altair_chart(cm_chart + text, use_container_width=True)
+        
+        # DISPLACEMENT HISTOGRAM
+        st.markdown("### Displacement Magnitude Distribution")
+        shifts = [x['Shift'] for x in m_res['details'] if x['Shift'] > 0]
+        if shifts:
+            df_hist = pd.DataFrame({"Displacement (m)": shifts})
+            hist = alt.Chart(df_hist).mark_bar(color='#00C9FF').encode(
+                x=alt.X("Displacement (m)", bin=True),
+                y='count()'
+            )
+            st.altair_chart(hist, use_container_width=True)
+
+    with tab3:
+        st.subheader("🤖 AI Executive Summary (RAG)")
+        st.info("This module uses Gemini to explain the geometric changes.")
+        
+        if st.button("Generate AI Explanation"):
+            # Prepare context for RAG
+            stats_text = f"""
+            Total Roads: {len(d['roads'])}
+            Conflicts Detected (TP): {m_res['matrix']['TP']}
+            Unresolved Conflicts (FN): {m_res['matrix']['FN']}
+            F1 Score: {m_res['scores']['F1']:.2f}
+            Avg Displacement: {sum(shifts)/len(shifts) if shifts else 0:.2f} meters.
+            """
+            
+            explanation = get_gemini_explanation(stats_text, "Algorithm: Parallel Offset Displacement.")
+            st.markdown(explanation)import streamlit as st
+import geopandas as gpd
+from shapely.wkt import loads
+from shapely.geometry import LineString
+import folium
+from folium.plugins import SideBySideLayers
+from streamlit_folium import st_folium
+import re
+import pandas as pd
+import altair as alt
+import google.generativeai as genai  # NEW: For RAG
+
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Axes Systems: Spatial Intelligence", layout="wide", page_icon="🗺️")
+
+# --- CUSTOM CSS ---
+st.markdown("""
+<style>
+    .stApp { background-color: #0E1117; color: white; }
+    div[data-testid="stMetric"] {
+        background-color: #1F2937; padding: 15px; border-radius: 10px;
+        border-left: 5px solid #00C9FF; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    h1, h2, h3 { font-family: 'Helvetica Neue', sans-serif; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- GEMINI RAG CONFIGURATION ---
+# INSTRUCTION: Get your key from https://aistudio.google.com/
+# Set it in your secrets or paste it below (not recommended for production)
+GEMINI_API_KEY = st.sidebar.text_input("🔑 Gemini API Key (for Explanations)", type="password")
+
+def get_gemini_explanation(stats_summary, context_text):
+    """
+    RAG Function: Sends geometric data to Gemini for a natural language explanation.
+    """
+    if not GEMINI_API_KEY:
+        return "⚠️ Please enter a Gemini API Key in the sidebar to generate an AI explanation."
+    
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        prompt = f"""
+        You are a senior Civil Engineer AI. Analyze this displacement report.
+        
+        DATA CONTEXT:
+        We have a highway and local roads. We moved roads that were too close to the highway.
+        
+        STATISTICS:
+        {stats_summary}
+        
+        TECHNICAL DETAILS:
+        {context_text}
+        
+        TASK:
+        1. Summarize what happened in plain English for a city planner.
+        2. Explain the "Safety Score" (F1 Score) and what it implies about the algorithm's performance.
+        3. Point out any specific roads that moved significantly.
+        """
+        
+        with st.spinner("🤖 AI is analyzing the geometry..."):
+            response = model.generate_content(prompt)
+            return response.text
+    except Exception as e:
+        return f"Error connecting to AI: {e}"
+
+# --- GEOMETRY UTILS ---
+def parse_wkt_data(raw_text):
+    geometries = []
+    if not raw_text or not raw_text.strip(): return geometries
+    try:
+        clean_text = raw_text.replace('\n', ' ').replace('\r', ' ')
+        matches = re.findall(r'LINESTRING\s*\([^)]+\)', clean_text)
+        for wkt in matches: geometries.append(loads(wkt))
+    except Exception as e: st.error(f"Parsing Error: {e}")
+    return geometries
+
+def calculate_advanced_metrics(highway, original_roads, displaced_roads, clearance, road_width=3.0, h_width=5.0):
+    """
+    Calculates Confusion Matrix elements and F1 Score for the geometric operation.
+    """
+    safe_dist = (h_width/2) + (road_width/2) + clearance
+    highway_buffer = highway.buffer(safe_dist)
+    
+    tp = 0 # Needed moving & Moved successfully
+    fp = 0 # Didn't need moving & Moved (Efficiency loss)
+    fn = 0 # Needed moving & NOT Moved (Safety violation)
+    tn = 0 # Didn't need moving & NOT Moved
+    
+    details = []
+    
+    for orig, new in zip(original_roads, displaced_roads):
+        was_unsafe = orig.intersects(highway_buffer)
+        is_moved = orig != new
+        is_now_safe = not new.intersects(highway_buffer)
+        
+        if was_unsafe and is_moved and is_now_safe:
+            tp += 1
+            status = "TP (Fixed)"
+        elif was_unsafe and (not is_moved or not is_now_safe):
+            fn += 1
+            status = "FN (Safety Fail)"
+        elif not was_unsafe and is_moved:
+            fp += 1
+            status = "FP (Unnecessary Move)"
         else:
-            highway = max(all_lines, key=lambda x: x.length)
-            roads = [line for line in all_lines if line != highway]
+            tn += 1
+            status = "TN (Clean)"
             
-            fixed_roads, metrics = displace_features(highway, roads, clearance)
+        # Calculate shift distance
+        shift = 0
+        if is_moved:
+            try:
+                shift = orig.centroid.distance(new.centroid)
+            except: pass
             
-            # Save results to session state
-            st.session_state['results'] = {
-                'highway': highway,
-                'roads': roads,
-                'fixed_roads': fixed_roads,
-                'metrics': metrics,
-                'total': len(all_lines)
-            }
+        details.append({"Status": status, "Shift": shift})
 
-# --- RENDER RESULTS WITH LAYERS ---
-if 'results' in st.session_state:
-    res = st.session_state['results']
+    # F1 Score Calculation
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     
-    # 1. Metrics
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Features", res['total'])
-    c2.metric("Conflicts Found", res['metrics']["overlaps_found"])
-    c3.metric("Conflicts Resolved", res['metrics']["overlaps_fixed"])
-    
-    # 2. Advanced Map with Layers (CORRECTED FOR LOCAL COORDINATES)
-    centroid = res['highway'].centroid
-    
-    # FIX: crs="Simple" and tiles=None allows plotting raw x/y coordinates
-    m = folium.Map(
-        location=[centroid.y, centroid.x], 
-        zoom_start=16, 
-        crs="Simple", 
-        tiles=None
-    )
-    
-    # --- Layer 1: Highway (Thick Orange) ---
-    fg_highway = folium.FeatureGroup(name="🟧 Highway (Base)")
-    folium.PolyLine(
-        [(p[1], p[0]) for p in res['highway'].coords], 
-        color="#FFA500", weight=8, opacity=1, tooltip="Highway"
-    ).add_to(fg_highway)
-    fg_highway.add_to(m)
-    
-    # --- Layer 2: Original Roads (Red Dashed) ---
-    fg_original = folium.FeatureGroup(name="🔴 Original Roads (Conflicts)")
-    for r in res['roads']:
-        folium.PolyLine(
-            [(p[1], p[0]) for p in r.coords], 
-            color="#FF0000", weight=2, dash_array="5, 10", opacity=0.8, tooltip="Original"
-        ).add_to(fg_original)
-    fg_original.add_to(m)
-    
-    # --- Layer 3: Displaced Roads (Green Solid) ---
-    fg_displaced = folium.FeatureGroup(name="✅ Displaced Roads (Fixed)")
-    for r in res['fixed_roads']:
-        folium.PolyLine(
-            [(p[1], p[0]) for p in r.coords], 
-            color="#00FF00", weight=3, opacity=1, tooltip="Displaced"
-        ).add_to(fg_displaced)
-    fg_displaced.add_to(m)
-    
-    # ADD LAYER CONTROL (The Magic Toggle Box)
-    folium.LayerControl(collapsed=False).add_to(m)
-    
-    st_folium(m, width="100%", height=600)
+    return {
+        "matrix": {"TP": tp, "FP": fp, "FN": fn, "TN": tn},
+        "scores": {"Precision": precision, "Recall": recall, "F1": f1},
+        "details": details
+    }
 
-    # --- STEP 4: EXPORT DATA ---
-    st.markdown("---")
-    st.subheader("💾 Export Results")
+def displace_features(highway, roads, clearance):
+    displaced_roads = []
+    road_width = 3.0
+    h_width = 5.0
+    safe_buffer_distance = (h_width / 2) + (road_width / 2) + clearance
+    highway_buffer = highway.buffer(safe_buffer_distance)
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # 1. REAL DATA (The one judges check for accuracy)
-        geojson_data = gpd.GeoSeries(res['fixed_roads']).to_json()
-        st.download_button(
-            label="Download REAL Data (Local Coords)",
-            data=geojson_data,
-            file_name="displaced_roads_original.geojson",
-            mime="application/json",
-            help="Use this file with desktop GIS software like QGIS."
-        )
+    for road in roads:
+        if road.intersects(highway_buffer):
+            distance_to_move = safe_buffer_distance * 1.05
+            shifted = road.parallel_offset(distance_to_move, 'left', join_style=2)
+            if shifted.is_empty or not isinstance(shifted, LineString):
+                 shifted = road.parallel_offset(distance_to_move, 'right', join_style=2)
+            
+            if not shifted.is_empty and isinstance(shifted, LineString):
+                displaced_roads.append(shifted)
+            else:
+                displaced_roads.append(road) # Fail safe
+        else:
+            displaced_roads.append(road)
+            
+    return displaced_roads
 
-    with col2:
-        # 2. WEB DATA (The one for geojson.io)
-        web_lines = normalize_for_web(res['fixed_roads'])
-        geojson_web = gpd.GeoSeries(web_lines).to_json()
-        st.download_button(
-            label="Download Web-Viewable Data",
-            data=geojson_web,
-            file_name="displaced_roads_web_view.geojson",
-            mime="application/json",
-            help="Use this file on geojson.io to verify the SHAPE."
-        )
+# --- MAIN APP ---
+st.title("🗺️ Axes Systems: AI Geometric Optimization")
+
+with st.sidebar:
+    st.header("⚙️ Controls")
+    clearance = st.slider("Clearance Buffer", 0.5, 5.0, 2.0)
+    input_method = st.radio("Input:", ["Upload File", "Paste Text"])
+    raw_data = ""
+    if input_method == "Paste Text":
+        raw_data = st.text_area("Paste WKT:", height=150)
+    else:
+        uploaded_file = st.file_uploader("Upload WKT", type=["wkt", "txt"])
+        if uploaded_file is not None: raw_data = uploaded_file.read().decode("utf-8")
+
+if st.button("🚀 Run Analysis"):
+    all_lines = parse_wkt_data(raw_data)
+    if len(all_lines) > 1:
+        highway = max(all_lines, key=lambda x: x.length)
+        roads = [line for line in all_lines if line != highway]
+        
+        # 1. Run Displacement
+        fixed_roads = displace_features(highway, roads, clearance)
+        
+        # 2. Calculate Advanced Metrics
+        metrics = calculate_advanced_metrics(highway, roads, fixed_roads, clearance)
+        
+        st.session_state['data'] = {
+            'highway': highway, 'roads': roads, 'fixed': fixed_roads, 'metrics': metrics
+        }
+    else:
+        st.error("Need at least 2 lines.")
+
+if 'data' in st.session_state:
+    d = st.session_state['data']
+    m_res = d['metrics']
     
-    st.success("Processing Complete!")
+    # --- TABBED INTERFACE ---
+    tab1, tab2, tab3 = st.tabs(["📍 Visualizer", "📊 Analytics & F1", "🤖 AI Report (RAG)"])
+    
+    with tab1:
+        st.subheader("Interactive Displacement Map")
+        centroid = d['highway'].centroid
+        m = folium.Map(location=[centroid.y, centroid.x], zoom_start=16, crs="Simple", tiles=None)
+        
+        folium.PolyLine([(p[1], p[0]) for p in d['highway'].coords], color="orange", weight=8).add_to(m)
+        
+        fg_orig = folium.FeatureGroup(name="Before")
+        for r in d['roads']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="red", weight=2).add_to(fg_orig)
+        
+        fg_new = folium.FeatureGroup(name="After")
+        for r in d['fixed']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#00FF00", weight=3).add_to(fg_new)
+        
+        SideBySideLayers(layer_left=fg_orig, layer_right=fg_new).add_to(m)
+        folium.LayerControl().add_to(m)
+        st_folium(m, width="100%")
+
+    with tab2:
+        st.subheader("Performance Metrics")
+        
+        # F1 SCORE ROW
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("F1 Score", f"{m_res['scores']['F1']:.2f}")
+        c2.metric("Precision", f"{m_res['scores']['Precision']:.2f}")
+        c3.metric("Recall", f"{m_res['scores']['Recall']:.2f}")
+        c4.metric("Total Roads", len(d['roads']))
+        
+        # CONFUSION MATRIX VISUALIZATION
+        st.markdown("### Confusion Matrix (Geometric Accuracy)")
+        matrix_data = pd.DataFrame([
+            {"Actual": "Unsafe", "Predicted": "Moved", "Count": m_res['matrix']['TP'], "Type": "True Positive"},
+            {"Actual": "Unsafe", "Predicted": "Static", "Count": m_res['matrix']['FN'], "Type": "False Negative"},
+            {"Actual": "Safe", "Predicted": "Moved", "Count": m_res['matrix']['FP'], "Type": "False Positive"},
+            {"Actual": "Safe", "Predicted": "Static", "Count": m_res['matrix']['TN'], "Type": "True Negative"}
+        ])
+        
+        cm_chart = alt.Chart(matrix_data).mark_rect().encode(
+            x='Predicted:N',
+            y='Actual:N',
+            color='Count:Q',
+            tooltip=['Type', 'Count']
+        ).properties(title="Confusion Matrix")
+        
+        text = cm_chart.mark_text(baseline='middle').encode(text='Count:Q', color=alt.value('white'))
+        st.altair_chart(cm_chart + text, use_container_width=True)
+        
+        # DISPLACEMENT HISTOGRAM
+        st.markdown("### Displacement Magnitude Distribution")
+        shifts = [x['Shift'] for x in m_res['details'] if x['Shift'] > 0]
+        if shifts:
+            df_hist = pd.DataFrame({"Displacement (m)": shifts})
+            hist = alt.Chart(df_hist).mark_bar(color='#00C9FF').encode(
+                x=alt.X("Displacement (m)", bin=True),
+                y='count()'
+            )
+            st.altair_chart(hist, use_container_width=True)
+
+    with tab3:
+        st.subheader("🤖 AI Executive Summary (RAG)")
+        st.info("This module uses Gemini to explain the geometric changes.")
+        
+        if st.button("Generate AI Explanation"):
+            # Prepare context for RAG
+            stats_text = f"""
+            Total Roads: {len(d['roads'])}
+            Conflicts Detected (TP): {m_res['matrix']['TP']}
+            Unresolved Conflicts (FN): {m_res['matrix']['FN']}
+            F1 Score: {m_res['scores']['F1']:.2f}
+            Avg Displacement: {sum(shifts)/len(shifts) if shifts else 0:.2f} meters.
+            """
+            
+            explanation = get_gemini_explanation(stats_text, "Algorithm: Parallel Offset Displacement.")
+            st.markdown(explanation)
