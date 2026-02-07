@@ -24,48 +24,70 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- SIDEBAR: MODEL & KEY CONFIGURATION ---
+# --- SECRETS MANAGEMENT (Auto-Load Key) ---
+# Try to get key from Streamlit Secrets, otherwise warn user
+try:
+    if "GEMINI_API_KEY" in st.secrets:
+        GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    else:
+        GEMINI_API_KEY = None
+except FileNotFoundError:
+    GEMINI_API_KEY = None
+
+# --- SIDEBAR: CONTROLS ---
 with st.sidebar:
     st.header("🤖 AI Configuration")
-    GEMINI_API_KEY = st.text_input("🔑 Gemini API Key", type="password")
     
-    # NEW: Model Selector with the versions you provided
+    # Status Indicator
+    if GEMINI_API_KEY:
+        st.success("✅ API Key Loaded Securely")
+    else:
+        st.error("❌ No API Key Found in Secrets")
+        st.info("Add your key to .streamlit/secrets.toml (Local) or Streamlit Cloud Settings.")
+
+    # VALID Model Options (Only ones that exist today)
     model_options = {
-        "Gemini 3 Pro (Most Intelligent)": "gemini-3.0-pro-001",
-        "Gemini 3 Flash (Balanced)": "gemini-3.0-flash-001", 
-        "Gemini 2.5 Pro (Advanced Thinking)": "gemini-2.5-pro-latest",
-        "Gemini 2.5 Flash (Fast & Intelligent)": "gemini-2.5-flash-latest",
-        "Gemini 2.5 Flash-Lite (Ultra Fast)": "gemini-2.5-flash-lite-latest",
-        "Gemini 1.5 Pro (Legacy Stable)": "gemini-1.5-pro",
-        "Gemini 1.5 Flash (Legacy Fast)": "gemini-1.5-flash"
+        "Gemini 1.5 Pro (Best for Reasoning)": "gemini-1.5-pro",
+        "Gemini 1.5 Flash (Fastest)": "gemini-1.5-flash",
+        "Gemini 1.0 Pro (Standard)": "gemini-pro"
     }
-    
-    selected_model_name = st.selectbox("Select Model Version:", list(model_options.keys()))
+    selected_model_name = st.selectbox("Select Model:", list(model_options.keys()))
     SELECTED_MODEL_ID = model_options[selected_model_name]
+
+    st.markdown("---")
+    st.header("⚙️ Simulation Controls")
+    clearance = st.slider("Clearance Buffer", 0.5, 5.0, 2.0)
+    input_method = st.radio("Input:", ["Upload File", "Paste Text"])
+    
+    raw_data = ""
+    if input_method == "Paste Text": 
+        raw_data = st.text_area("Paste WKT:")
+    else:
+        uploaded_file = st.file_uploader("Upload WKT", type=["wkt", "txt"])
+        if uploaded_file is not None: 
+            raw_data = uploaded_file.read().decode("utf-8")
 
 # --- RAG FUNCTION ---
 def get_gemini_explanation(stats_summary, context_text):
     if not GEMINI_API_KEY:
-        return "⚠️ Please enter a Gemini API Key in the sidebar to generate an AI explanation."
+        return "⚠️ API Key missing. Please configure Streamlit Secrets."
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        
-        # Use the user-selected model
         model = genai.GenerativeModel(SELECTED_MODEL_ID)
         
         prompt = f"""
-        You are a Civil Engineer AI using {selected_model_name}. Analyze this displacement report.
+        You are a Civil Engineer AI. Analyze this displacement report.
         STATS: {stats_summary}
         CONTEXT: {context_text}
         TASK: Summarize the safety improvements and explain the F1 score in simple terms.
         """
-        with st.spinner(f"🤖 {selected_model_name} is analyzing..."):
+        with st.spinner(f"🤖 AI is analyzing..."):
             response = model.generate_content(prompt)
             return response.text
     except Exception as e: 
-        return f"Error connecting to AI: {e}. (Note: Verify if your API key has access to {SELECTED_MODEL_ID})"
+        return f"Error: {e}"
 
-# --- GEOMETRY UTILS ---
+# --- GEOMETRY & UTILS ---
 def parse_wkt_data(raw_text):
     geometries = []
     if not raw_text or not raw_text.strip(): return geometries
@@ -77,43 +99,26 @@ def parse_wkt_data(raw_text):
     return geometries
 
 def normalize_to_latlon_auto_scale(geometries):
-    """
-    Robust Normalization: Fits ANY coordinate system into a viewable NYC block.
-    """
     if not geometries: return []
-    
-    # 1. Get bounds of original data
     min_x = min(min(p[0] for p in g.coords) for g in geometries)
     min_y = min(min(p[1] for p in g.coords) for g in geometries)
     max_x = max(max(p[0] for p in g.coords) for g in geometries)
     max_y = max(max(p[1] for p in g.coords) for g in geometries)
     
-    width = max_x - min_x
-    height = max_y - min_y
+    width = max_x - min_x if (max_x - min_x) > 0 else 1
+    height = max_y - min_y if (max_y - min_y) > 0 else 1
     
-    # Avoid division by zero
-    if width == 0: width = 1
-    if height == 0: height = 1
-    
-    # 2. Scale factor: We want the max dimension to be roughly 0.02 degrees (visible city view)
     target_size = 0.02
-    scale_x = target_size / width
-    scale_y = target_size / height
-    final_scale = min(scale_x, scale_y) # Maintain aspect ratio
+    scale_factor = min(target_size/width, target_size/height)
     
-    center_x = (min_x + max_x) / 2
-    center_y = (min_y + max_y) / 2
+    center_x, center_y = (min_x + max_x)/2, (min_y + max_y)/2
     
     vis_geoms = []
     for g in geometries:
-        # A. Center at (0,0)
         shifted = translate(g, xoff=-center_x, yoff=-center_y)
-        # B. Scale to Lat/Lon size
-        scaled = scale(shifted, xfact=final_scale, yfact=final_scale, origin=(0,0))
-        # C. Move to NYC (Manhattan)
+        scaled = scale(shifted, xfact=scale_factor, yfact=scale_factor, origin=(0,0))
         final = translate(scaled, xoff=-74.0060, yoff=40.7128)
         vis_geoms.append(final)
-        
     return vis_geoms
 
 def calculate_advanced_metrics(highway, original_roads, displaced_roads, clearance):
@@ -122,26 +127,22 @@ def calculate_advanced_metrics(highway, original_roads, displaced_roads, clearan
     highway_buffer = highway.buffer(safe_dist)
     
     tp, fp, fn, tn = 0, 0, 0, 0
-    details = []
     
     for orig, new in zip(original_roads, displaced_roads):
         was_unsafe = orig.intersects(highway_buffer)
         is_moved = orig != new
         is_now_safe = not new.intersects(highway_buffer)
         
-        if was_unsafe and is_moved and is_now_safe: tp += 1; status="TP"
-        elif was_unsafe and (not is_moved or not is_now_safe): fn += 1; status="FN"
-        elif not was_unsafe and is_moved: fp += 1; status="FP"
-        else: tn += 1; status="TN"
+        if was_unsafe and is_moved and is_now_safe: tp += 1
+        elif was_unsafe and (not is_moved or not is_now_safe): fn += 1
+        elif not was_unsafe and is_moved: fp += 1
+        else: tn += 1
         
-        shift = orig.centroid.distance(new.centroid) if is_moved else 0
-        details.append({"Status": status, "Shift": shift})
-
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     
-    return {"matrix": {"TP": tp, "FP": fp, "FN": fn, "TN": tn}, "scores": {"F1": f1, "Precision": precision, "Recall": recall}, "details": details}
+    return {"matrix": {"TP": tp, "FP": fp, "FN": fn, "TN": tn}, "scores": {"F1": f1, "Precision": precision, "Recall": recall}}
 
 def displace_features(highway, roads, clearance):
     displaced_roads = []
@@ -159,41 +160,24 @@ def displace_features(highway, roads, clearance):
             displaced_roads.append(road)
     return displaced_roads
 
-# --- MAIN APP ---
-st.title("🗺️ Axes Systems: AI Geometric Optimization")
-
-with st.sidebar:
-    st.markdown("---")
-    st.header("⚙️ Simulation Controls")
-    clearance = st.slider("Clearance Buffer", 0.5, 5.0, 2.0)
-    input_method = st.radio("Input:", ["Upload File", "Paste Text"])
-    raw_data = ""
-    if input_method == "Paste Text": raw_data = st.text_area("Paste WKT:")
-    else:
-        uploaded_file = st.file_uploader("Upload WKT", type=["wkt", "txt"])
-        if uploaded_file is not None: raw_data = uploaded_file.read().decode("utf-8")
-
+# --- MAIN APP LOGIC ---
 if st.button("🚀 Run Analysis"):
     all_lines = parse_wkt_data(raw_data)
     if len(all_lines) > 1:
         highway = max(all_lines, key=lambda x: x.length)
         roads = [line for line in all_lines if line != highway]
         
-        # 1. Calculation
         fixed_roads = displace_features(highway, roads, clearance)
         metrics = calculate_advanced_metrics(highway, roads, fixed_roads, clearance)
         
-        # 2. Visualization (Auto-Scaled to NYC)
-        all_geoms = [highway] + roads + fixed_roads
-        vis_all = normalize_to_latlon_auto_scale(all_geoms)
-        
-        vis_highway = vis_all[0]
-        vis_roads = vis_all[1:len(roads)+1]
-        vis_fixed = vis_all[len(roads)+1:]
-        
+        # Visualize
+        vis_all = normalize_to_latlon_auto_scale([highway] + roads + fixed_roads)
         st.session_state['data'] = {
-            'vis_highway': vis_highway, 'vis_roads': vis_roads, 'vis_fixed': vis_fixed,
-            'metrics': metrics, 'total_roads': len(roads)
+            'vis_highway': vis_all[0],
+            'vis_roads': vis_all[1:len(roads)+1],
+            'vis_fixed': vis_all[len(roads)+1:],
+            'metrics': metrics,
+            'total': len(roads)
         }
     else: st.error("Need at least 2 lines.")
 
@@ -204,42 +188,23 @@ if 'data' in st.session_state:
     tab1, tab2, tab3 = st.tabs(["📍 Visualizer", "📊 Analytics", "🤖 AI Report"])
     
     with tab1:
-        st.subheader("Interactive Map (Projected View)")
+        c = d['vis_highway'].centroid
+        m = folium.Map(location=[c.y, c.x], zoom_start=15, tiles="CartoDB dark_matter")
+        folium.PolyLine([(p[1], p[0]) for p in d['vis_highway'].coords], color="orange", weight=6).add_to(m)
         
-        # Determine map center dynamically
-        if d['vis_highway']:
-            c = d['vis_highway'].centroid
-            start_loc = [c.y, c.x]
-        else:
-            start_loc = [40.7128, -74.0060]
-
-        m = folium.Map(location=start_loc, zoom_start=15, tiles="CartoDB dark_matter")
+        fg_orig = folium.FeatureGroup(name="Before")
+        for r in d['vis_roads']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="red", weight=2).add_to(fg_orig)
+        fg_orig.add_to(m)
         
-        # Add Highway
-        folium.PolyLine([(p[1], p[0]) for p in d['vis_highway'].coords], color="#FFA500", weight=6, opacity=1, tooltip="Highway").add_to(m)
+        fg_new = folium.FeatureGroup(name="After")
+        for r in d['vis_fixed']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#00FF00", weight=2).add_to(fg_new)
+        fg_new.add_to(m)
         
-        # Layer: Before
-        fg_orig = folium.FeatureGroup(name="Before Displacement")
-        for r in d['vis_roads']: 
-            folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#FF4B4B", weight=2, opacity=0.7).add_to(fg_orig)
-        fg_orig.add_to(m) # Add to map so it's visible by default
-            
-        # Layer: After
-        fg_new = folium.FeatureGroup(name="After Displacement")
-        for r in d['vis_fixed']: 
-            folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#00FF00", weight=2, opacity=1).add_to(fg_new)
-        fg_new.add_to(m) # Add to map so it's visible by default
-
-        # Add Split Screen Slider
         SideBySideLayers(layer_left=fg_orig, layer_right=fg_new).add_to(m)
         folium.LayerControl().add_to(m)
         
-        # IMPORTANT: Fit Bounds to ensure visibility
-        sw = d['vis_highway'].bounds[0:2]
-        ne = d['vis_highway'].bounds[2:4]
-        # Folium expects [lat, lon], shapely gives [lon, lat]
+        sw, ne = d['vis_highway'].bounds[0:2], d['vis_highway'].bounds[2:4]
         m.fit_bounds([[sw[1], sw[0]], [ne[1], ne[0]]])
-        
         st_folium(m, width="100%", height=500)
 
     with tab2:
@@ -247,16 +212,10 @@ if 'data' in st.session_state:
         c1.metric("F1 Score", f"{m_res['scores']['F1']:.2f}")
         c2.metric("Precision", f"{m_res['scores']['Precision']:.2f}")
         c3.metric("Recall", f"{m_res['scores']['Recall']:.2f}")
-        c4.metric("Roads Analyzed", d['total_roads'])
+        c4.metric("Total", d['total'])
         
-        matrix_df = pd.DataFrame([
-            {"Type": "Fixed (TP)", "Count": m_res['matrix']['TP']},
-            {"Type": "Missed (FN)", "Count": m_res['matrix']['FN']},
-            {"Type": "Unnecessary (FP)", "Count": m_res['matrix']['FP']},
-            {"Type": "Clean (TN)", "Count": m_res['matrix']['TN']}
-        ])
-        chart = alt.Chart(matrix_df).mark_bar().encode(x='Type', y='Count', color=alt.Color('Type', scale=alt.Scale(scheme='spectral')))
-        st.altair_chart(chart, use_container_width=True)
+        df = pd.DataFrame([{"Type": k, "Count": v} for k,v in m_res['matrix'].items()])
+        st.altair_chart(alt.Chart(df).mark_bar().encode(x='Type', y='Count', color='Type'), use_container_width=True)
 
     with tab3:
         if st.button("Generate AI Explanation"):
