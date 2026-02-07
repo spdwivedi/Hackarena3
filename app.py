@@ -24,8 +24,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- SECRETS MANAGEMENT (Auto-Load Key) ---
-# Try to get key from Streamlit Secrets, otherwise warn user
+# --- SECRETS MANAGEMENT ---
 try:
     if "GEMINI_API_KEY" in st.secrets:
         GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -38,19 +37,30 @@ except FileNotFoundError:
 with st.sidebar:
     st.header("🤖 AI Configuration")
     
-    # Status Indicator
     if GEMINI_API_KEY:
         st.success("✅ API Key Loaded Securely")
     else:
-        st.error("❌ No API Key Found in Secrets")
-        st.info("Add your key to .streamlit/secrets.toml (Local) or Streamlit Cloud Settings.")
+        st.error("❌ No API Key Found")
+        st.info("Add GEMINI_API_KEY to .streamlit/secrets.toml")
 
-    # VALID Model Options (Only ones that exist today)
+    # UPDATED MODEL LIST (Based on your Jan 2026 Logs) 
     model_options = {
-        "Gemini 1.5 Pro (Best for Reasoning)": "gemini-1.5-pro",
-        "Gemini 1.5 Flash (Fastest)": "gemini-1.5-flash",
-        "Gemini 1.0 Pro (Standard)": "gemini-pro"
+        # LATEST (Gemini 3 Series)
+        "Gemini 3 Pro Preview (Latest & Smartest)": "gemini-3-pro-preview",
+        "Gemini 3 Flash Preview (Fastest Frontier)": "gemini-3-flash-preview",
+        
+        # STABLE (Gemini 1.5 Series)
+        "Gemini 1.5 Pro (Stable Workhorse)": "gemini-1.5-pro",
+        "Gemini 1.5 Flash (Production Fast)": "gemini-1.5-flash",
+        "Gemini 1.5 Flash-8B (Ultra Low Cost)": "gemini-1.5-flash-8b",
+
+        # EXPERIMENTAL & LEGACY (Gemini 2.0 Series)
+        "Gemini 2.0 Pro Exp (Experimental 02-05)": "gemini-2.0-pro-exp-02-05",
+        "Gemini 2.0 Flash Thinking (Reasoning)": "gemini-2.0-flash-thinking-exp-01-21",
+        "Gemini 2.0 Flash (Deprecating Mar '26)": "gemini-2.0-flash",
+        "Gemini 2.0 Flash-Lite (Deprecating Mar '26)": "gemini-2.0-flash-lite",
     }
+    
     selected_model_name = st.selectbox("Select Model:", list(model_options.keys()))
     SELECTED_MODEL_ID = model_options[selected_model_name]
 
@@ -76,16 +86,16 @@ def get_gemini_explanation(stats_summary, context_text):
         model = genai.GenerativeModel(SELECTED_MODEL_ID)
         
         prompt = f"""
-        You are a Civil Engineer AI. Analyze this displacement report.
+        You are a Civil Engineer AI using {SELECTED_MODEL_ID}. Analyze this displacement report.
         STATS: {stats_summary}
         CONTEXT: {context_text}
         TASK: Summarize the safety improvements and explain the F1 score in simple terms.
         """
-        with st.spinner(f"🤖 AI is analyzing..."):
+        with st.spinner(f"🤖 {SELECTED_MODEL_ID} is analyzing..."):
             response = model.generate_content(prompt)
             return response.text
     except Exception as e: 
-        return f"Error: {e}"
+        return f"Error with {SELECTED_MODEL_ID}: {e}"
 
 # --- GEOMETRY & UTILS ---
 def parse_wkt_data(raw_text):
@@ -99,7 +109,13 @@ def parse_wkt_data(raw_text):
     return geometries
 
 def normalize_to_latlon_auto_scale(geometries):
+    """
+    Robust Normalization: Centers data at [0,0] (Null Island) for clean visualization
+    regardless of input coordinate system (UTM, Feet, Meters).
+    """
     if not geometries: return []
+    
+    # 1. Get bounds
     min_x = min(min(p[0] for p in g.coords) for g in geometries)
     min_y = min(min(p[1] for p in g.coords) for g in geometries)
     max_x = max(max(p[0] for p in g.coords) for g in geometries)
@@ -108,17 +124,23 @@ def normalize_to_latlon_auto_scale(geometries):
     width = max_x - min_x if (max_x - min_x) > 0 else 1
     height = max_y - min_y if (max_y - min_y) > 0 else 1
     
-    target_size = 0.02
+    # 2. Target size: ~0.04 degrees (roughly 4km city block size)
+    target_size = 0.04
     scale_factor = min(target_size/width, target_size/height)
     
+    # 3. Center point of original data
     center_x, center_y = (min_x + max_x)/2, (min_y + max_y)/2
     
     vis_geoms = []
     for g in geometries:
+        # Move to (0,0) then scale
         shifted = translate(g, xoff=-center_x, yoff=-center_y)
+        # Scale to match Lat/Lon decimal degrees
         scaled = scale(shifted, xfact=scale_factor, yfact=scale_factor, origin=(0,0))
-        final = translate(scaled, xoff=-74.0060, yoff=40.7128)
-        vis_geoms.append(final)
+        # Move to a neutral visible location (e.g., Off coast of Africa at 0,0)
+        # This avoids map projection distortions
+        vis_geoms.append(scaled)
+        
     return vis_geoms
 
 def calculate_advanced_metrics(highway, original_roads, displaced_roads, clearance):
@@ -188,24 +210,43 @@ if 'data' in st.session_state:
     tab1, tab2, tab3 = st.tabs(["📍 Visualizer", "📊 Analytics", "🤖 AI Report"])
     
     with tab1:
+        # Determine center for map
         c = d['vis_highway'].centroid
-        m = folium.Map(location=[c.y, c.x], zoom_start=15, tiles="CartoDB dark_matter")
-        folium.PolyLine([(p[1], p[0]) for p in d['vis_highway'].coords], color="orange", weight=6).add_to(m)
         
-        fg_orig = folium.FeatureGroup(name="Before")
-        for r in d['vis_roads']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="red", weight=2).add_to(fg_orig)
+        # SWITCHED TILES: OpenStreetMap is safer than Dark Matter (which needs API keys sometimes)
+        m = folium.Map(location=[c.y, c.x], zoom_start=14, tiles="OpenStreetMap")
+        
+        # Highway (Orange, Thick)
+        folium.PolyLine(
+            [(p[1], p[0]) for p in d['vis_highway'].coords], 
+            color="#FFA500", weight=8, opacity=0.9, tooltip="Highway"
+        ).add_to(m)
+        
+        # Create Feature Groups
+        fg_orig = folium.FeatureGroup(name="Before (Red)")
+        fg_new = folium.FeatureGroup(name="After (Green)")
+
+        # Populate Groups
+        for r in d['vis_roads']: 
+            folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#FF0000", weight=3, opacity=0.7).add_to(fg_orig)
+            
+        for r in d['vis_fixed']: 
+            folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#00FF00", weight=3, opacity=0.9).add_to(fg_new)
+
+        # Add to map individually first to ensure they render
         fg_orig.add_to(m)
-        
-        fg_new = folium.FeatureGroup(name="After")
-        for r in d['vis_fixed']: folium.PolyLine([(p[1], p[0]) for p in r.coords], color="#00FF00", weight=2).add_to(fg_new)
         fg_new.add_to(m)
         
+        # Add Swipe Control
         SideBySideLayers(layer_left=fg_orig, layer_right=fg_new).add_to(m)
         folium.LayerControl().add_to(m)
         
+        # FORCE BOUNDS: Ensures map looks at the data, not the ocean
         sw, ne = d['vis_highway'].bounds[0:2], d['vis_highway'].bounds[2:4]
+        # Folium bounds are [[Lat, Lon], [Lat, Lon]]
         m.fit_bounds([[sw[1], sw[0]], [ne[1], ne[0]]])
-        st_folium(m, width="100%", height=500)
+        
+        st_folium(m, width="100%", height=600)
 
     with tab2:
         c1, c2, c3, c4 = st.columns(4)
@@ -215,7 +256,11 @@ if 'data' in st.session_state:
         c4.metric("Total", d['total'])
         
         df = pd.DataFrame([{"Type": k, "Count": v} for k,v in m_res['matrix'].items()])
-        st.altair_chart(alt.Chart(df).mark_bar().encode(x='Type', y='Count', color='Type'), use_container_width=True)
+        st.altair_chart(alt.Chart(df).mark_bar().encode(
+            x='Type', 
+            y='Count', 
+            color=alt.Color('Type', scale=alt.Scale(scheme='spectral'))
+        ), use_container_width=True)
 
     with tab3:
         if st.button("Generate AI Explanation"):
